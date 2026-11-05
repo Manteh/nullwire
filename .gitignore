@@ -27,3 +27,6 @@ s*.png
 c*.png
 test*.log
 run*.log
+
+# ...but keep images that the README shows
+!docs/*.png
