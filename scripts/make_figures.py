@@ -13,20 +13,24 @@ DATA = open(sys.argv[1] if len(sys.argv) > 1 else "/tmp/figdata.txt").read().spl
 
 STYLE = """
 <style>
-  .panel{fill:#fcfcfb}.ink{fill:#1a1a19}.mut{fill:#6b6a63}.grid{stroke:#e2e1da;stroke-width:1}.axis{stroke:#9b9a92;stroke-width:1}
-  .a{stroke:#2a78d6}.b{stroke:#eb6834}.g{stroke:#8a897f}.af{fill:#2a78d6}.bf{fill:#eb6834}.gf{fill:#8a897f}
-  .afade{fill:#2a78d6;opacity:.14}.bfade{fill:#eb6834;opacity:.14}.soft{fill:#efeee8}.line{fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round}
-  text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
-  @media (prefers-color-scheme: dark){
-    .panel{fill:#1a1a19}.ink{fill:#f0efec}.mut{fill:#c3c2b7}.grid{stroke:#34332f}.axis{stroke:#6b6a63}
-    .a{stroke:#3987e5}.b{stroke:#d95926}.af{fill:#3987e5}.bf{fill:#d95926}.afade{fill:#3987e5}.bfade{fill:#d95926}.soft{fill:#262522}
-  }
+  /* GitHub dark: page #0d1117, cards #161b22, borders #30363d. Data colors validated for dark surfaces. */
+  .panel{fill:#0d1117;stroke:#21262d;stroke-width:1}.ink{fill:#e6edf3}.mut{fill:#8b949e}
+  .grid{stroke:#21262d;stroke-width:1}.axis{stroke:#484f58;stroke-width:1}
+  .a{stroke:#388bfd}.b{stroke:#db6d28}.g{stroke:#6e7681}.af{fill:#388bfd}.bf{fill:#db6d28}.gf{fill:#6e7681}
+  .afade{fill:#388bfd;opacity:.16}.bfade{fill:#db6d28;opacity:.16}
+  .soft{fill:#161b22;stroke:#30363d;stroke-width:1}.line{fill:none;stroke-width:2.75;stroke-linecap:round;stroke-linejoin:round}
+  .onacc{fill:#0d1117}
+  text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
 </style>"""
 
 
 def svg(w, h, body, title):
     return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}" role="img" aria-label="{html.escape(title)}">'
-            f'<title>{html.escape(title)}</title>{STYLE}<rect class="panel" width="{w}" height="{h}" rx="14"/>{body}</svg>')
+            f'<title>{html.escape(title)}</title>{STYLE}'
+            f'<defs><pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse"><circle cx="1.5" cy="1.5" r="1" fill="#1b2029"/></pattern>'
+            f'<linearGradient id="bar" x1="0" x2="1"><stop offset="0" stop-color="#388bfd"/><stop offset="1" stop-color="#db6d28"/></linearGradient></defs>'
+            f'<rect class="panel" x=".5" y=".5" width="{w - 1}" height="{h - 1}" rx="14"/><rect width="{w}" height="{h}" rx="14" fill="url(#dots)"/>'
+            f'<rect x="28" y="0" width="64" height="3" rx="1.5" fill="url(#bar)"/>{body}</svg>')
 
 
 def t(x, y, s, cls="ink", size=13, weight=400, anchor="start", extra=""):
@@ -34,7 +38,7 @@ def t(x, y, s, cls="ink", size=13, weight=400, anchor="start", extra=""):
 
 
 def heading(title, sub, w):
-    return t(28, 40, title, size=20, weight=700) + t(28, 62, sub, "mut", 13)
+    return t(28, 42, title, size=21, weight=800) + t(28, 64, sub, "mut", 13.5)
 
 
 class Chart:
@@ -71,21 +75,21 @@ def rows(kind):
 # ---------------------------------------------------------------------------------------------------------------------
 def hero():
     w, h = 1000, 350
-    b = '<defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#2a78d6"/><stop offset="1" stop-color="#eb6834"/></linearGradient></defs>'
-    b += f'<rect x="0" y="0" width="{w}" height="6" fill="url(#g)" rx="3"/>'
-    b += t(w / 2, 82, "Nullwire", "ink", 54, 800, "middle")
-    b += t(w / 2, 118, "Teach a thumbstick to move like a mouse.", "mut", 20, 400, "middle")
-    # mouse
+    b = '<defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#388bfd"/><stop offset="1" stop-color="#db6d28"/></linearGradient>'
+    b += '<radialGradient id="gb"><stop offset="0" stop-color="#388bfd" stop-opacity=".30"/><stop offset="1" stop-color="#388bfd" stop-opacity="0"/></radialGradient>'
+    b += '<radialGradient id="go"><stop offset="0" stop-color="#db6d28" stop-opacity=".30"/><stop offset="1" stop-color="#db6d28" stop-opacity="0"/></radialGradient></defs>'
+    b += '<ellipse cx="170" cy="225" rx="170" ry="120" fill="url(#gb)"/><ellipse cx="850" cy="225" rx="170" ry="120" fill="url(#go)"/>'
+    b += f'<rect x="0" y="0" width="{w}" height="5" fill="url(#g)"/>'
+    b += t(w / 2, 86, "Nullwire", "ink", 56, 800, "middle", 'letter-spacing="-1"')
+    b += t(w / 2, 122, "Teach a thumbstick to move like a mouse.", "mut", 20, 400, "middle")
     b += '<g transform="translate(120,160)"><rect class="soft" x="0" y="0" width="86" height="120" rx="40"/><rect class="a" x="0" y="0" width="86" height="120" rx="40" fill="none" stroke-width="3"/><line class="a" x1="43" y1="0" x2="43" y2="46" stroke-width="3"/><rect class="af" x="39" y="14" width="8" height="20" rx="4"/></g>'
-    b += t(163, 304, "Your mouse", "ink", 14, 600, "middle") + t(163, 322, "says where to look", "mut", 12, anchor="middle")
-    # arrow 1 + engine
+    b += t(163, 306, "Your mouse", "ink", 14, 700, "middle") + t(163, 325, "says where to look", "mut", 12, anchor="middle")
     b += '<path class="g" d="M240,220 H330" stroke-width="3" fill="none" stroke-dasharray="2 7" stroke-linecap="round"/><path class="gf" d="M326,211 L344,220 L326,229 Z"/>'
     b += '<g transform="translate(352,170)"><rect class="soft" width="296" height="100" rx="16"/><rect fill="none" class="b" width="296" height="100" rx="16" stroke-width="3"/>'
-    b += t(148, 42, "Ballistics engine", "ink", 18, 700, "middle") + t(148, 66, "turns positions into stick pushes", "mut", 13, anchor="middle") + t(148, 84, "and measures the game by watching it", "mut", 13, anchor="middle") + '</g>'
-    # arrow 2 + stick
+    b += t(148, 42, "Ballistics engine", "ink", 18, 800, "middle") + t(148, 66, "turns positions into stick pushes", "mut", 13, anchor="middle") + t(148, 84, "and measures the game by watching it", "mut", 13, anchor="middle") + '</g>'
     b += '<path class="g" d="M664,220 H754" stroke-width="3" fill="none" stroke-dasharray="2 7" stroke-linecap="round"/><path class="gf" d="M750,211 L768,220 L750,229 Z"/>'
     b += '<g transform="translate(850,220)"><circle class="soft" r="62"/><circle class="b" r="62" fill="none" stroke-width="3"/><circle class="grid" r="42" fill="none" stroke-dasharray="3 5"/><circle class="bf" cx="22" cy="-18" r="24"/></g>'
-    b += t(850, 304, "PS5 thumbstick", "ink", 14, 600, "middle") + t(850, 322, "over Remote Play, no hardware", "mut", 12, anchor="middle")
+    b += t(850, 306, "PS5 thumbstick", "ink", 14, 700, "middle") + t(850, 325, "over Remote Play, no hardware", "mut", 12, anchor="middle")
     open(os.path.join(OUT, "hero.svg"), "w").write(svg(w, h, b, "A mouse feeds the Nullwire engine, which drives a PS5 thumbstick over Remote Play"))
 
 
@@ -264,7 +268,7 @@ def calib():
     b = heading("The game gets measured by watching it.", "Press one key. About 30 seconds later it knows the deadzone, curve, turn speed and delay.", w)
     for i, (n, name, desc, tm) in enumerate(stages):
         x = 28 + i * 160; y = 100
-        b += f'<g transform="translate({x},{y})"><rect class="soft" width="148" height="240" rx="14"/><circle class="{"af" if i % 2 == 0 else "bf"}" cx="30" cy="34" r="16"/>' + t(30, 40, n, "ink", 14, 800, "middle", 'fill="#fff" style="fill:#fff"')
+        b += f'<g transform="translate({x},{y})"><rect class="soft" width="148" height="240" rx="14"/><circle class="{"af" if i % 2 == 0 else "bf"}" cx="30" cy="34" r="16"/>' + t(30, 40, n, "onacc", 14, 800, "middle")
         b += t(18, 82, name, "ink", 15, 700)
         words, line, ls = desc.split(), "", []
         for wd in words:
@@ -292,6 +296,29 @@ def scorecard():
     open(os.path.join(OUT, "scorecard.svg"), "w").write(svg(w, h, b, "Headline measured numbers"))
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# 11. One engine, many inputs
+# ---------------------------------------------------------------------------------------------------------------------
+def inputs():
+    w, h = 1000, 400
+    b = heading("Anything that moves could become a stick.", "The engine only needs to know how far something moved. It doesn't care what moved it.", w)
+    items = [("Mouse", "works today", True), ("Trackball", "idea", False), ("Head tracker", "idea", False), ("Phone gyro", "idea", False), ("Adaptive device", "idea", False)]
+    for i, (name, note, live) in enumerate(items):
+        y = 96 + i * 56
+        dash = "" if live else 'stroke-dasharray="6 5"'
+        cl = "a" if live else "g"
+        b += f'<rect class="soft" x="40" y="{y}" width="230" height="44" rx="12"/><rect class="{cl}" x="40" y="{y}" width="230" height="44" rx="12" fill="none" stroke-width="2.5" {dash}/>'
+        b += t(60, y + 28, name, "ink", 14.5, 700) + t(254, y + 28, note, "ink" if live else "mut", 12, 700 if live else 400, "end")
+        b += f'<path class="g" d="M270,{y + 22} C330,{y + 22} 340,236 400,236" fill="none" stroke-width="2" {dash}/>'
+    b += '<g transform="translate(400,176)"><rect class="soft" width="230" height="120" rx="16"/><rect class="b" width="230" height="120" rx="16" fill="none" stroke-width="3"/>'
+    b += t(115, 50, "Nullwire engine", "ink", 17, 800, "middle") + t(115, 74, "movement in,", "mut", 12.5, anchor="middle") + t(115, 92, "thumbstick pushes out", "mut", 12.5, anchor="middle") + "</g>"
+    b += '<path class="g" d="M630,236 H730" stroke-width="3" fill="none" stroke-dasharray="2 7" stroke-linecap="round"/><path class="gf" d="M726,227 L744,236 L726,245 Z"/>'
+    b += '<g transform="translate(850,236)"><circle class="soft" r="64"/><circle class="b" r="64" fill="none" stroke-width="3"/><circle class="grid" r="42" fill="none" stroke-dasharray="3 5"/><circle class="bf" cx="-20" cy="-22" r="24"/></g>'
+    b += t(850, 330, "any PS5 game", "ink", 14, 700, "middle") + t(850, 348, "that reads a stick", "mut", 12, anchor="middle")
+    b += t(500, 386, "Only the mouse exists today. The rest are ideas the design makes possible, not features we have built.", "mut", 11.5, anchor="middle")
+    open(os.path.join(OUT, "inputs.svg"), "w").write(svg(w, h, b, "A mouse works today, and other input devices could in future feed the same engine that drives a PS5 thumbstick"))
+
+
 if __name__ == "__main__":
-    for f in (hero, position_vs_speed, payout, flick, response, pull, circles, wifi, calib, scorecard): f()
+    for f in (hero, inputs, position_vs_speed, payout, flick, response, pull, circles, wifi, calib, scorecard): f()
     print("wrote", len(os.listdir(OUT)), "figures to", os.path.abspath(OUT))
