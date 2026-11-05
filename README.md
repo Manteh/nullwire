@@ -1,8 +1,6 @@
 <div align="center">
 
-# Nullwire
-
-### Teach a thumbstick to move like a mouse.
+<img src="docs/figures/hero.svg" alt="Nullwire: a mouse feeds the ballistics engine, which drives a PS5 thumbstick over Remote Play" width="900">
 
 **A zero-hardware way to give a PlayStation 5 mouse-precise aim, built on Sony's own Remote Play, and tuned by letting the computer watch the game and measure it.**
 
@@ -26,6 +24,10 @@ The part we're proudest of: **it doesn't guess how the game responds. It looks.*
 > [!NOTE]
 > This is a working prototype, tested on one real PS5 in one game. Everything in this README that says "measured" was measured on that setup, and we say plainly where it falls short. Honest numbers are the whole point.
 
+<p align="center">
+  <img src="docs/figures/scorecard.svg" alt="Headline measured numbers: deadzone, turn speed, tracking error, circle closure, update rate and delay" width="900">
+</p>
+
 ---
 
 ## Why this is exciting
@@ -48,6 +50,10 @@ Think of a car.
 - A **thumbstick is a gas pedal for turning**: push right and the camera *keeps* turning right at a speed set by how far you pushed, until you let go.
 
 So a mouse says **"turn exactly 40 degrees."** A stick can only say **"turn at this speed until I say stop."** Turning one into the other means working out, many times a second, *how hard to push the stick, and for how long, so the camera ends up exactly 40 degrees around.*
+
+<p align="center">
+  <img src="docs/figures/position-vs-speed.svg" alt="A mouse commands a position while a thumbstick commands a turning speed" width="900">
+</p>
 
 That's the entire problem, and it's trickier than it looks:
 
@@ -87,8 +93,20 @@ You can keep playing on your TV over HDMI. The video on the computer exists to t
 ### 1. The payout window
 When the mouse moves, the engine doesn't dump the whole push into one instant. It queues the angle and **pays it out evenly over a short window** (24 ms by default), then returns the stick to exactly zero. An earlier version let the push fade out slowly, and the stick lingered near the deadzone edge for about 150 ms after you stopped, which made the camera creep. A fixed window fixes it.
 
+<p align="center">
+  <img src="docs/figures/payout-window.svg" alt="The new payout window returns the stick to zero soon after the hand stops, while the old fading push lingers above the deadzone" width="900">
+</p>
+<p align="center"><sub>Drawn from the real engine's output (<code>scripts/figdata.cpp</code>).</sub></p>
+
+
 ### 2. The flick reservoir
 Flick faster than the stick's top speed and the camera can't keep up. The engine banks the extra turn and pays it out at full tilt, so a big flick still goes the full distance. If you reverse direction mid-flick, it drops the leftover and does what your hand is doing *now*, because your hand always wins.
+
+<p align="center">
+  <img src="docs/figures/flick-reservoir.svg" alt="A 90 degree flick lands at 90 degrees with a large reservoir and stops short with a small one" width="900">
+</p>
+<p align="center"><sub>Today's default is the small reservoir, which keeps the stick responsive but caps how far one huge flick can go. Choosing the best size is on the roadmap.</sub></p>
+
 
 ### 3. The deadzone kiss
 Games ignore small stick pushes. Nullwire knows the measured deadzone and starts every movement *just past* it, so the very first millimeter of mouse movement turns the camera. Slow, precise aiming survives.
@@ -96,12 +114,22 @@ Games ignore small stick pushes. Nullwire knows the measured deadzone and starts
 ### 4. Measuring the game's quirks
 The tests found real quirks, and the engine corrects for them:
 - **Looking up and down is slower than left and right** (about 0.68 to 0.74 of the horizontal speed for the same stick push). Uncorrected, circles come out as ovals.
-- **Hard pushes get pulled toward the axes** (up to about 9 to 10 degrees off-angle), which squares off diagonal and circular motion. The engine aims slightly off to land on the right direction.
+- **Hard pushes get pulled toward the axes** (about 9 to 11 degrees off-angle on hard pushes), which squares off diagonal and circular motion. The engine aims slightly off to land on the right direction.
+
+<p align="center">
+  <img src="docs/figures/direction-pull.svg" alt="At hard pushes the game bends the camera direction by up to about eleven degrees, gentle pushes barely bend it" width="900">
+</p>
+
 
 ### 5. Self-calibration from video
 Press one key and the routine runs five stages: **settle**, **latency**, **deadzone**, **response curve**, then a **full 360-degree turn** to get real degrees per second. It also warns if the speed keeps building while you hold the stick (a sign that in-game ease-in or smoothing is on, which can't be corrected from the outside).
 
 On simulated games with known answers, it recovers the deadzone, speed and curve and cuts the aiming error by an order of magnitude. On the real PS5 it settled on the same numbers every time.
+
+<p align="center">
+  <img src="docs/figures/calibration-stages.svg" alt="The six stages of automatic calibration: settle, latency, deadzone, response curve, ramp check and full turn" width="900">
+</p>
+
 
 ---
 
@@ -120,6 +148,11 @@ On simulated games with known answers, it recovers the deadzone, speed and curve
 | Stick-to-picture delay | **76 to 81 ms** | Includes the video trip back to the Mac |
 | Bridge update rate | **250 per second**, worst gap 6 to 8 ms | Own high-priority thread |
 
+
+<p align="center">
+  <img src="docs/figures/game-response.svg" alt="Measured camera speed against stick push follows a straight line past the deadzone" width="900">
+</p>
+
 ### How accurately the camera follows the mouse
 
 On a quiet network, with a level, detailed view:
@@ -130,6 +163,11 @@ On a quiet network, with a level, detailed view:
 | Real flicks, 5 / 10 / 20 degrees | Landed at about **5.0 / 9.4 to 9.8 / 19.3 to 20.9** degrees |
 | Random two-axis paths, up to 120 deg/s | About **0.2 degrees** of error per quarter second |
 | Random two-axis paths, up to 300 deg/s | About **0.45 degrees** of error per quarter second |
+
+
+<p align="center">
+  <img src="docs/figures/circle-accuracy.svg" alt="After drawing circles, slow and medium ones end within about half a degree, fast ones end a few degrees off" width="900">
+</p>
 
 <p align="center">
   <img src="docs/circles.png" alt="The camera's path (colored) against the mouse's exact circles (dashed), old settings versus the measured corrections" width="860">
@@ -142,6 +180,11 @@ On a quiet network, with a level, detailed view:
 ## The honest part: where it isn't there yet
 
 We would rather you trust the good numbers than be surprised by the rest.
+
+<p align="center">
+  <img src="docs/figures/wifi-scan.svg" alt="A Wi-Fi scan raises aiming error from about one degree to about twenty degrees" width="900">
+</p>
+
 
 | Challenge | What we found | What it means |
 |---|---|---|
