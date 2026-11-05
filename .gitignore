@@ -1,0 +1,29 @@
+# Build artifacts
+bin/
+build/
+*.o
+*.a
+*.dylib
+*.app
+*.log
+
+# System files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Scratch & dumps
+*.pgm
+*.png.pgm
+s*.png
+c*.png
+test*.log
+run*.log

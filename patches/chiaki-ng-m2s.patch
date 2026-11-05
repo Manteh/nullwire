@@ -1,0 +1,892 @@
+diff --git a/gui/CMakeLists.txt b/gui/CMakeLists.txt
+index 7e777e1..588684c 100755
+--- a/gui/CMakeLists.txt
++++ b/gui/CMakeLists.txt
+@@ -80,6 +80,9 @@ if(APPLE)
+ 		src/macMicPermission.m
+ 		include/macWakeSleep.h
+ 		src/macWakeSleep.cpp
++		include/macMouseBridge.h
++		src/macMouseBridge.mm
++		include/mouse_to_stick.h
+ 	)
+ elseif(WIN32)
+ 	list(APPEND SOURCE_FILES
+@@ -139,7 +142,7 @@ if(NOT CHIAKI_ENABLE_FFMPEG_DECODER)
+ 	message(FATAL_ERROR "Chiaki GUI requires CHIAKI_ENABLE_FFMPEG_DECODER=ON")
+ endif()
+ if(APPLE)
+-	target_link_libraries(chiaki "-framework AVFoundation" "-framework IOKit")
++	target_link_libraries(chiaki "-framework AVFoundation" "-framework IOKit" "-framework GameController" "-framework Cocoa")
+ endif()
+ 
+ # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fanalyzer")
+diff --git a/gui/include/streamsession.h b/gui/include/streamsession.h
+index 52439ce..96238b9 100755
+--- a/gui/include/streamsession.h
++++ b/gui/include/streamsession.h
+@@ -42,6 +42,9 @@
+ #include <QThread>
+ #include <QWaitCondition>
+ #include <QAtomicInteger>
++#include <thread>
++#include <mutex>
++#include <atomic>
+ #if CHIAKI_GUI_ENABLE_SPEEX
+ #include <QQueue>
+ #include <speex/speex_echo.h>
+@@ -220,6 +223,21 @@ class StreamSession : public QObject
+ 		bool rumble_haptics_on;
+ 		float PS_TOUCHPAD_MAX_X, PS_TOUCHPAD_MAX_Y;
+ 		ChiakiControllerState keyboard_state;
++		ChiakiControllerState mouse_state;   // mouse->stick bridge (macOS)
++		QTimer *mouse_timer = nullptr;
++		void *mouse_m2s = nullptr;           // m2s::MouseToStick*
++		qint64 mouse_last_ns = 0;
++		void MouseBridgeStep(double dt);              // runs on mouse_thread, mouse_mutex held
++		void MouseThreadMain();
++		void MouseTestChannelMain();
++		std::thread mouse_test_thread;
++		void MouseSendLocked();
++		void MouseMergeAndSend(ChiakiControllerState *state);
++		std::thread mouse_thread;
++		std::atomic<bool> mouse_thread_stop{false};
++		std::mutex mouse_mutex;                       // guards mouse_state, mouse_base_state, mouse_m2s
++		ChiakiControllerState mouse_base_state;       // last state from everything except the mouse
++		int mouse_sends = 0;
+ 		ChiakiControllerState touch_state;
+ 		QMap<int, uint8_t> touch_tracker;
+ 		int8_t mouse_touch_id;
+diff --git a/gui/src/qml/Main.qml b/gui/src/qml/Main.qml
+index 141eacc..d1fb0a8 100644
+--- a/gui/src/qml/Main.qml
++++ b/gui/src/qml/Main.qml
+@@ -168,6 +168,7 @@ Item {
+     }
+ 
+     function showRendererFallbackDialog(reason) {
++        return;   // bridge build: this popup draws corrupted over the stream under OpenGL
+         showInfoDialog(qsTr("Renderer Fallback"),
+                        qsTr("Vulkan renderer is unavailable and chiaki-ng switched to OpenGL.\n\nReason: %1").arg(reason));
+     }
+diff --git a/gui/src/qmlbackend.cpp b/gui/src/qmlbackend.cpp
+index d188a79..580f064 100644
+--- a/gui/src/qmlbackend.cpp
++++ b/gui/src/qmlbackend.cpp
+@@ -35,6 +35,10 @@
+ 
+ extern "C" {
+ #include <chiaki/time.h>
++#ifdef Q_OS_MACOS
++struct AVFrame;
++void m2s_calib_on_frame(AVFrame *frame);
++#endif
+ #include <libavcodec/avcodec.h>
+ #include <libavutil/pixdesc.h>
+ #include <libavutil/pixfmt.h>
+@@ -1135,6 +1139,9 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
+         if (frame.recovered)
+             pending_recovered_frame.storeRelaxed(1);
+ 
++#ifdef Q_OS_MACOS
++        m2s_calib_on_frame(frame.frame);
++#endif
+         const qint64 prepare_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+         if (!prepareFrameForPresentation(frame, use_opengl_renderer))
+         {
+diff --git a/gui/src/streamsession.cpp b/gui/src/streamsession.cpp
+index 44d7a0e..bc4123c 100755
+--- a/gui/src/streamsession.cpp
++++ b/gui/src/streamsession.cpp
+@@ -19,6 +19,148 @@
+ #include <algorithm>
+ 
+ #include <cstring>
++#ifdef Q_OS_MACOS
++#include <pthread.h>
++#include <chrono>
++static std::atomic<int> g_m2s_main_ticks{0}, g_m2s_main_gap{0};
++static std::atomic<bool> g_m2s_hold_on{false};
++static std::atomic<double> g_m2s_hold_x{0}, g_m2s_hold_y{0};
++static bool g_m2s_sweep = false;      // deadzone sweep: slowly raise the stick until the camera moves
++static double g_m2s_sweep_v = 0;
++static int g_m2s_cal_ticks = 0;
++static int g_m2s_cal_level = 0;      // cycles 25/50/75/100% of assumed full-stick speed
++static double g_m2s_cal_frac = 0.5;   // test spin: injected mouse counts for calibration
++#include "macMouseBridge.h"
++#include "mouse_to_stick.h"
++#include "m2s_calib.h"
++#include "m2s_track2d.h"
++#include "m2s_keys.h"
++#include <sys/time.h>
++#include <random>
++#include <QDir>
++#include <chrono>
++extern "C" {
++#include <libavutil/frame.h>
++#include <libavutil/hwcontext.h>
++#include <libavutil/pixfmt.h>
++}
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <unistd.h>
++#include <cstdio>
++#include <string>
++#include <map>
++// two-axis path test: what was asked for and what the picture did, both timestamped
++struct M2sSample { double t, a, b; };
++static m2s::Tracker2D *g_m2s_t2d = nullptr;
++static bool g_m2s_t2d_on = false;
++static std::vector<M2sSample> g_m2s_seen, g_m2s_asked;
++extern "C" void chiaki_feedback_sender_set_state_resend_ms(int ms);
++extern "C" void chiaki_feedback_sender_set_extra_sends(int n);
++#include <netinet/ip.h>
++static std::atomic<int> g_m2s_tick_ms{4};
++static m2s::DirKeys g_m2s_keys;
++// Flight recorder: the last 10 seconds of input and stick, saved when the player marks a hitch.
++struct M2sTick { double t, dx, dy, sx, sy; };
++static M2sTick g_m2s_ring[2600];
++static long g_m2s_ring_n = 0;
++static bool g_m2s_trace = false;
++static double m2sEpoch();
++static m2s::AutoCalib g_m2s_calib;
++static m2s::CalibResult g_m2s_last_cal;
++// test channel state: frame dump and camera-turn tracker
++static std::mutex g_m2s_test_mtx;
++static std::string g_m2s_shot_path;
++static std::atomic<bool> g_m2s_frame_wanted{false};
++static bool g_m2s_track_on = false, g_m2s_track_have = false;
++static double g_m2s_track_offset = 0, g_m2s_track_px = 0, g_m2s_track_prev[m2s::AutoCalib::N];
++static int g_m2s_track_frames = 0, g_m2s_track_bad = 0;
++static double m2sNow() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
++static std::string m2sConfigPath()
++{
++	QString dir = QDir::homePath() + "/Library/Application Support/m2s-bridge";
++	QDir().mkpath(dir);
++	return (dir + "/m2s.conf").toStdString();
++}
++static double m2sEpoch() { timeval tv; gettimeofday(&tv, nullptr); return tv.tv_sec + tv.tv_usec * 1e-6; }
++// Called on the video thread for every decoded frame. Does nothing unless a calibration is running.
++extern "C" void m2s_calib_on_frame(AVFrame *f)
++{
++	if(!f || (!g_m2s_calib.active() && !g_m2s_frame_wanted.load()))
++		return;
++	AVFrame *sw = nullptr;
++	const AVFrame *use = f;
++	if(f->hw_frames_ctx)
++	{
++		sw = av_frame_alloc();
++		if(!sw || av_hwframe_transfer_data(sw, f, 0) < 0) { av_frame_free(&sw); return; }
++		use = sw;
++	}
++	int step = 0, offset = 0;
++	switch(use->format)
++	{
++		case AV_PIX_FMT_NV12: case AV_PIX_FMT_YUV420P: case AV_PIX_FMT_YUVJ420P: step = 1; break;
++		case AV_PIX_FMT_P010LE: step = 2; offset = 1; break;
++		default: { static bool said = false; if(!said) { said = true; fprintf(stderr, "[m2s] calibration: unsupported video format %d\n", use->format); } }
++	}
++	if(step && g_m2s_calib.active())
++		g_m2s_calib.onFrame(use->data[0], use->width, use->height, use->linesize[0], m2sNow(), step, offset);
++	if(step && g_m2s_frame_wanted.load())
++	{
++		std::lock_guard<std::mutex> l(g_m2s_test_mtx);
++		if(!g_m2s_shot_path.empty())
++		{
++			if(FILE *o = fopen(g_m2s_shot_path.c_str(), "wb"))
++			{
++				fprintf(o, "P5\n%d %d\n255\n", use->width, use->height);
++				for(int y = 0; y < use->height; y++)
++				{
++					const uint8_t *r = use->data[0] + y * use->linesize[0];
++					for(int x = 0; x < use->width; x++) fputc(r[x * step + offset], o);
++				}
++				fclose(o);
++			}
++			g_m2s_shot_path.clear();
++		}
++		if(g_m2s_t2d_on && g_m2s_t2d)
++		{
++			g_m2s_t2d->feed(use->data[0], use->width, use->height, use->linesize[0], step, offset);
++			g_m2s_seen.push_back({m2sNow(), g_m2s_t2d->x(), g_m2s_t2d->y()});
++			if(g_m2s_trace && g_m2s_seen.size() > 2400) g_m2s_seen.erase(g_m2s_seen.begin(), g_m2s_seen.begin() + 1200);
++		}
++		if(g_m2s_track_on)
++		{
++			double p[m2s::AutoCalib::N], sh = 0;
++			double contrast = m2s::AutoCalib::profile(use->data[0], use->width, use->height, use->linesize[0], step, offset, p);
++			if(g_m2s_track_have && contrast > 1.0)
++			{
++				// Compare against a held keyframe, not the previous frame: slow motion then adds up to
++				// whole pixels instead of being lost in per-frame rounding, and still frames can't drift.
++				if(m2s::AutoCalib::slide(g_m2s_track_prev, p, sh))
++				{
++					g_m2s_track_offset = sh;
++					if(std::fabs(sh) >= 24)
++					{
++						g_m2s_track_px += sh; g_m2s_track_offset = 0;
++						std::copy(p, p + m2s::AutoCalib::N, g_m2s_track_prev);
++					}
++				}
++				else
++					g_m2s_track_bad++;
++			}
++			else if(!g_m2s_track_have)
++				std::copy(p, p + m2s::AutoCalib::N, g_m2s_track_prev);
++			g_m2s_track_have = true; g_m2s_track_frames++;
++		}
++		if(!g_m2s_track_on && !g_m2s_t2d_on)
++			g_m2s_frame_wanted = false;
++	}
++	if(sw)
++		av_frame_free(&sw);
++}
++#include <QElapsedTimer>
++#endif
+ 
+ #define SETSU_UPDATE_INTERVAL_MS 4
+ #define STEAMDECK_UPDATE_INTERVAL_MS 4
+@@ -290,6 +432,16 @@ StreamSessionConnectInfo::StreamSessionConnectInfo(
+ 	// remote connection
+ 	else
+ 		video_profile = chiaki_target_is_ps5(target) ? settings->GetVideoProfileRemotePS5(): settings->GetVideoProfileRemotePS4();
++	if(qEnvironmentVariable("M2S_STREAM") == "low")
++	{
++		// Lowest video we can ask for: the player watches the TV.
++		video_profile.width = 640; video_profile.height = 360; video_profile.bitrate = 1000; video_profile.max_fps = 30;
++	}
++	if(qEnvironmentVariable("M2S_STREAM") == "360")
++	{
++		// Player watches the TV, so spend as little Wi-Fi as possible on the stream.
++		video_profile.width = 640; video_profile.height = 360; video_profile.bitrate = 2000;
++	}
+ 	this->target = target;
+ 	this->nickname = std::move(nickname);
+ 	this->host = std::move(host);
+@@ -513,6 +665,34 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
+ 	}
+ 
+ 	chiaki_controller_state_set_idle(&keyboard_state);
++	chiaki_controller_state_set_idle(&mouse_state);
++#ifdef Q_OS_MACOS
++	{
++		auto *m = new m2s::MouseToStick();
++		m->p.deadzone = 0.02;     // until measured; saved settings below replace this
++		bool loaded = m2s::loadConfig(m2sConfigPath(), m->p);
++		fprintf(stderr, "[m2s] saved settings: %s\n", loaded ? "loaded" : "none yet");
++		auto envd = [](const char *k, double &v){ if(qEnvironmentVariableIsSet(k)) v = qEnvironmentVariable(k).toDouble(); };
++		envd("M2S_SENS", m->p.deg_per_count); envd("M2S_WMAX", m->p.wmax_deg_s); envd("M2S_DZ", m->p.deadzone);
++		envd("M2S_EXPO", m->p.expo); envd("M2S_WINDOW", m->p.window_ms); envd("M2S_YSCALE", m->p.y_scale);
++		mouse_m2s = m;
++		MacMouse::start();
++		fprintf(stderr, "[m2s] start: sens %.4f wmax %.0f deadzone %.3f window %.0f ms, measured curve points %d\n", m->p.deg_per_count, m->p.wmax_deg_s, m->p.deadzone, m->p.window_ms, (int)m->p.curve.size());
++		chiaki_controller_state_set_idle(&mouse_base_state);
++		// diagnostic only: how often does the main thread get to run?
++		mouse_timer = new QTimer(this);
++		mouse_timer->setTimerType(Qt::PreciseTimer);
++		mouse_timer->setInterval(4);
++		connect(mouse_timer, &QTimer::timeout, this, []{
++			static QElapsedTimer c; if(!c.isValid()) c.start();
++			qint64 now = c.nsecsElapsed(); static qint64 last = now;
++			int gap = (int)((now - last) / 1000000); last = now;
++			g_m2s_main_ticks++;
++			int w = g_m2s_main_gap.load(); if(gap > w) g_m2s_main_gap.store(gap);
++		});
++		mouse_timer->start();
++	}
++#endif
+ 	chiaki_controller_state_set_idle(&touch_state);
+ 	touch_tracker=QMap<int, uint8_t>();
+ 	mouse_touch_id=-1;
+@@ -713,6 +893,16 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
+ 
+ StreamSession::~StreamSession()
+ {
++#ifdef Q_OS_MACOS
++	mouse_thread_stop = true;
++	if(mouse_thread.joinable())
++		mouse_thread.join();
++	if(mouse_test_thread.joinable())
++		mouse_test_thread.join();
++	MacMouse::setCapture(false);
++	delete static_cast<m2s::MouseToStick *>(mouse_m2s);
++	mouse_m2s = nullptr;
++#endif
+ 	mic_active.storeRelaxed(false);
+ 	StopAudioOutDrainThread();
+ 	if(audio_out)
+@@ -827,6 +1017,18 @@ void StreamSession::Start()
+ 	{
+ 		throw ChiakiException("Chiaki Session Start failed");
+ 	}
++#ifdef Q_OS_MACOS
++	if(!mouse_thread.joinable())
++		mouse_thread = std::thread([this]{ MouseThreadMain(); });
++	if(qEnvironmentVariableIsSet("M2S_TRACE"))
++	{
++		std::lock_guard<std::mutex> l(g_m2s_test_mtx);
++		if(!g_m2s_t2d) g_m2s_t2d = new m2s::Tracker2D;
++		g_m2s_trace = true; g_m2s_t2d_on = true; g_m2s_frame_wanted = true;
++	}
++	if(qEnvironmentVariableIsSet("M2S_TEST") && !mouse_test_thread.joinable())
++		mouse_test_thread = std::thread([this]{ MouseTestChannelMain(); });
++#endif
+ 	session_started = true;
+ }
+ 
+@@ -945,8 +1147,455 @@ void StreamSession::HandleMouseMoveEvent(QMouseEvent *event, qreal width, qreal
+ 	SendFeedbackState();
+ }
+ 
++void StreamSession::MouseMergeAndSend(ChiakiControllerState *state)
++{
++#ifdef Q_OS_MACOS
++	{
++		std::lock_guard<std::mutex> l(mouse_mutex);
++		mouse_base_state = *state;
++		if(!input_block)
++			chiaki_controller_state_or(state, state, &mouse_state);
++	}
++#endif
++	chiaki_session_set_controller_state(&session, state);
++}
++
++void StreamSession::MouseSendLocked()
++{
++#ifdef Q_OS_MACOS
++	if(input_block)
++		return;
++	ChiakiControllerState state = mouse_base_state;
++	chiaki_controller_state_or(&state, &state, &mouse_state);
++	double before = m2sNow();
++	chiaki_session_set_controller_state(&session, &state);
++	double waited = m2sNow() - before;
++	if(waited > 0.02) fprintf(stderr, "[m2s] SLOW SEND at %.3f: waited %.0f ms\n", m2sEpoch(), waited * 1000);
++	mouse_sends++;
++#endif
++}
++
++// Test channel (only with M2S_TEST set, only on localhost): lets a script drive and measure the bridge.
++void StreamSession::MouseTestChannelMain()
++{
++#ifdef Q_OS_MACOS
++	int fd = socket(AF_INET, SOCK_DGRAM, 0);
++	sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(47999); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++	timeval tv{0, 200000}; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++	if(bind(fd, (sockaddr *)&a, sizeof(a)) != 0) { fprintf(stderr, "[m2s] test channel: bind failed\n"); close(fd); return; }
++	fprintf(stderr, "[m2s] test channel on 127.0.0.1:47999\n");
++	static const std::map<std::string, uint32_t> btn = {
++		{"cross", CHIAKI_CONTROLLER_BUTTON_CROSS}, {"moon", CHIAKI_CONTROLLER_BUTTON_MOON}, {"box", CHIAKI_CONTROLLER_BUTTON_BOX},
++		{"pyramid", CHIAKI_CONTROLLER_BUTTON_PYRAMID}, {"up", CHIAKI_CONTROLLER_BUTTON_DPAD_UP}, {"down", CHIAKI_CONTROLLER_BUTTON_DPAD_DOWN},
++		{"left", CHIAKI_CONTROLLER_BUTTON_DPAD_LEFT}, {"right", CHIAKI_CONTROLLER_BUTTON_DPAD_RIGHT}, {"l1", CHIAKI_CONTROLLER_BUTTON_L1},
++		{"r1", CHIAKI_CONTROLLER_BUTTON_R1}, {"l3", CHIAKI_CONTROLLER_BUTTON_L3}, {"r3", CHIAKI_CONTROLLER_BUTTON_R3},
++		{"options", CHIAKI_CONTROLLER_BUTTON_OPTIONS}, {"share", CHIAKI_CONTROLLER_BUTTON_SHARE}, {"ps", CHIAKI_CONTROLLER_BUTTON_PS},
++		{"touchpad", CHIAKI_CONTROLLER_BUTTON_TOUCHPAD}};
++	char buf[512];
++	while(!mouse_thread_stop)
++	{
++		sockaddr_in from{}; socklen_t fl = sizeof(from);
++		ssize_t n = recvfrom(fd, buf, sizeof(buf) - 1, 0, (sockaddr *)&from, &fl);
++		if(n <= 0) continue;
++		buf[n] = 0;
++		char word[64] = {0}, arg[400] = {0}; double a1 = 0, a2 = 0, a3 = 0;
++		sscanf(buf, "%63s", word);
++		std::string reply = "ok";
++		std::string cmd = word;
++		if(cmd == "press" && sscanf(buf, "%*s %399s %lf", arg, &a1) >= 1 && btn.count(arg))
++		{
++			{ std::lock_guard<std::mutex> l(mouse_mutex); mouse_state.buttons |= btn.at(arg); MouseSendLocked(); }
++			std::this_thread::sleep_for(std::chrono::milliseconds((int)(a1 > 0 ? a1 : 120)));
++			{ std::lock_guard<std::mutex> l(mouse_mutex); mouse_state.buttons &= ~btn.at(arg); MouseSendLocked(); }
++		}
++		else if(cmd == "lstick" && sscanf(buf, "%*s %lf %lf %lf", &a1, &a2, &a3) == 3)
++		{
++			{ std::lock_guard<std::mutex> l(mouse_mutex); mouse_state.left_x = (int16_t)(a1 * 32767); mouse_state.left_y = (int16_t)(-a2 * 32767); MouseSendLocked(); }
++			std::this_thread::sleep_for(std::chrono::milliseconds((int)a3));
++			{ std::lock_guard<std::mutex> l(mouse_mutex); mouse_state.left_x = 0; mouse_state.left_y = 0; MouseSendLocked(); }
++		}
++		else if(cmd == "capture" && sscanf(buf, "%*s %lf", &a1) == 1) MacMouse::setHeadlessCapture(a1 != 0);
++		else if(cmd == "mouse" && sscanf(buf, "%*s %lf %lf", &a1, &a2) == 2) MacMouse::inject(a1, a2);
++		else if(cmd == "hold" && sscanf(buf, "%*s %lf %lf", &a1, &a2) == 2)
++		{
++			// exact stick value for an exact time, bypassing the conversion
++			auto end = std::chrono::steady_clock::now() + std::chrono::microseconds((long long)(a2 * 1000));
++			g_m2s_hold_x = a1; g_m2s_hold_on = true;
++			std::this_thread::sleep_until(end);
++			g_m2s_hold_x = 0;
++			std::this_thread::sleep_for(std::chrono::milliseconds(8));
++			g_m2s_hold_on = false;
++		}
++		else if(cmd == "bed") { QMetaObject::invokeMethod(this, [this]{ GoToBed(); }, Qt::QueuedConnection); }
++		else if(cmd == "quit") { QMetaObject::invokeMethod(this, [this]{ Stop(); }, Qt::QueuedConnection); }
++		else if(cmd == "lset" && sscanf(buf, "%*s %lf %lf", &a1, &a2) == 2)
++		{
++			std::lock_guard<std::mutex> l(mouse_mutex);
++			mouse_state.left_x = (int16_t)(a1 * 32767); mouse_state.left_y = (int16_t)(-a2 * 32767); MouseSendLocked();
++		}
++		else if(cmd == "btn" && sscanf(buf, "%*s %399s %lf", arg, &a1) == 2 && btn.count(arg))
++		{
++			std::lock_guard<std::mutex> l(mouse_mutex);
++			if(a1 != 0) mouse_state.buttons |= btn.at(arg); else mouse_state.buttons &= ~btn.at(arg);
++			MouseSendLocked();
++		}
++		else if(cmd == "fire" && sscanf(buf, "%*s %lf", &a1) == 1) MacMouse::setTestButtons(a1 != 0 ? 1 : 0);
++		else if(cmd == "hold2" && sscanf(buf, "%*s %lf %lf %lf", &a1, &a2, &a3) == 3)
++		{
++			// exact stick x and y (+y up) for an exact time, bypassing the conversion
++			auto end = std::chrono::steady_clock::now() + std::chrono::microseconds((long long)(a3 * 1000));
++			g_m2s_hold_x = a1; g_m2s_hold_y = a2; g_m2s_hold_on = true;
++			std::this_thread::sleep_until(end);
++			g_m2s_hold_x = 0; g_m2s_hold_y = 0;
++			std::this_thread::sleep_for(std::chrono::milliseconds(8));
++			g_m2s_hold_on = false;
++		}
++		else if(cmd == "t2d" && sscanf(buf, "%*s %lf", &a1) == 1)
++		{
++			std::lock_guard<std::mutex> l(g_m2s_test_mtx);
++			if(!g_m2s_t2d) g_m2s_t2d = new m2s::Tracker2D;
++			g_m2s_t2d->reset(); g_m2s_seen.clear(); g_m2s_asked.clear();
++			g_m2s_t2d_on = a1 != 0; g_m2s_frame_wanted = g_m2s_t2d_on || g_m2s_track_on;
++		}
++		else if(cmd == "t2dget")
++		{
++			std::lock_guard<std::mutex> l(g_m2s_test_mtx);
++			char o[120]; snprintf(o, sizeof(o), "%.3f %.3f %d %d", g_m2s_t2d ? g_m2s_t2d->x() : 0, g_m2s_t2d ? g_m2s_t2d->y() : 0, g_m2s_t2d ? g_m2s_t2d->frames() : 0, g_m2s_t2d ? g_m2s_t2d->bad() : 0);
++			reply = o;
++		}
++		else if(cmd == "t2ddump" && sscanf(buf, "%*s %399s", arg) == 1)
++		{
++			std::lock_guard<std::mutex> l(g_m2s_test_mtx);
++			if(FILE *o = fopen(arg, "w"))
++			{
++				for(const auto &v : g_m2s_seen) fprintf(o, "seen %.5f %.4f %.4f\n", v.t, v.a, v.b);
++				for(const auto &v : g_m2s_asked) fprintf(o, "asked %.5f %.4f %.4f\n", v.t, v.a, v.b);
++				fclose(o);
++			}
++		}
++		else if(cmd == "circle" && sscanf(buf, "%*s %lf %lf %lf", &a1, &a2, &a3) == 3)
++		{
++			// Mouse draws a circle: a1 radius in degrees, a2 ms per turn, a3 turns. Ends exactly where it began.
++			double sens, ys;
++			{ std::lock_guard<std::mutex> l(mouse_mutex); auto *m = static_cast<m2s::MouseToStick *>(mouse_m2s); sens = m->p.deg_per_count; ys = m->p.y_scale; }
++			long total = (long)(a2 * a3); double lastY = 0, lastP = 0, cx = 0, cy = 0;
++			auto start = std::chrono::steady_clock::now();
++			for(long tick = 1; tick <= total && !mouse_thread_stop; tick++)
++			{
++				std::this_thread::sleep_until(start + std::chrono::milliseconds(tick));
++				double th = 2 * M_PI * tick / a2, yaw = a1 * (std::cos(th) - 1), pitch = a1 * std::sin(th);
++				cx += (yaw - lastY) / sens; cy += -(pitch - lastP) / (sens * ys);
++				lastY = yaw; lastP = pitch;
++				double ix = std::trunc(cx), iy = std::trunc(cy);    // a mouse reports whole counts
++				cx -= ix; cy -= iy;
++				if(ix != 0 || iy != 0) MacMouse::inject(ix, iy);
++				if(tick % 4 == 0) { std::lock_guard<std::mutex> l(g_m2s_test_mtx); g_m2s_asked.push_back({m2sNow(), yaw, pitch}); }
++			}
++		}
++		else if((cmd == "chaos" || cmd == "chaosbg") && sscanf(buf, "%*s %lf %lf %lf", &a1, &a2, &a3) == 3)
++		{
++			auto job = [this, a1, a2, a3]{
++			// Random hand path: bursts in random directions, curving, at random speeds with short pauses.
++			// a1 seed, a2 duration ms, a3 fastest speed in deg/s. Pitch stays near level.
++			double sens, ys;
++			{ std::lock_guard<std::mutex> l(mouse_mutex); auto *m = static_cast<m2s::MouseToStick *>(mouse_m2s); sens = m->p.deg_per_count; ys = m->p.y_scale; }
++			std::mt19937 g((unsigned)a1); std::uniform_real_distribution<double> U(0, 1);
++			double yaw = 0, pitch = 0, cx = 0, cy = 0; const double dt = 0.001;
++			auto start = std::chrono::steady_clock::now(); long tick = 0; const long total = (long)a2;
++			while(tick < total && !mouse_thread_stop)
++			{
++				long len = 40 + (long)(U(g) * U(g) * 600);
++				double peak = 3 * std::pow(a3 / 3, U(g)), head = U(g) * 2 * M_PI, curve = (U(g) - 0.5) * 2 * M_PI;
++				if(pitch > 15 && std::sin(head) > 0) head = -head;
++				if(pitch < -15 && std::sin(head) < 0) head = -head;
++				for(long i = 0; i < len && tick < total; i++, tick++)
++				{
++					std::this_thread::sleep_until(start + std::chrono::milliseconds(tick + 1));
++					double u = (i + 0.5) / len, v = peak * 30 * u * u * (1 - u) * (1 - u) / 1.875, h = head + curve * u;
++					double vy = v * std::sin(h), vx = v * std::cos(h);
++					if(pitch > 22 && vy > 0) vy = 0;
++					if(pitch < -22 && vy < 0) vy = 0;
++					yaw += vx * dt; pitch += vy * dt;
++					cx += vx * dt / sens; cy += -vy * dt / (sens * ys);
++					double ix = std::trunc(cx), iy = std::trunc(cy);    // a mouse reports whole counts
++					cx -= ix; cy -= iy;
++					if(ix != 0 || iy != 0) MacMouse::inject(ix, iy);
++					if(tick % 4 == 0) { std::lock_guard<std::mutex> l(g_m2s_test_mtx); g_m2s_asked.push_back({m2sNow(), yaw, pitch}); }
++				}
++				long pause = U(g) < 0.5 ? 0 : (long)(U(g) * 150);
++				for(long i = 0; i < pause && tick < total; i++, tick++)
++				{
++					std::this_thread::sleep_until(start + std::chrono::milliseconds(tick + 1));
++					if(tick % 4 == 0) { std::lock_guard<std::mutex> l(g_m2s_test_mtx); g_m2s_asked.push_back({m2sNow(), yaw, pitch}); }
++				}
++			}
++					};
++			if(cmd == "chaosbg") std::thread(job).detach(); else job();
++		}
++		else if(cmd == "flick" && sscanf(buf, "%*s %lf %lf", &a1, &a2) == 2)
++		{
++			// Human-shaped move (minimum jerk): a1 degrees over a2 ms, timed here at 1000 Hz like a gaming mouse.
++			double sens; { std::lock_guard<std::mutex> l(mouse_mutex); sens = static_cast<m2s::MouseToStick *>(mouse_m2s)->p.deg_per_count; }
++			double counts = a1 / sens, done = 0, T = std::max(a2, 1.0) / 1000.0;
++			auto t0 = std::chrono::steady_clock::now();
++			for(int i = 1; ; i++)
++			{
++				auto tgt = t0 + std::chrono::milliseconds(i);
++				std::this_thread::sleep_until(tgt);
++				double u = std::min(1.0, i / 1000.0 / T), pos = counts * u * u * u * (10 - 15 * u + 6 * u * u);
++				MacMouse::inject(pos - done, 0); done = pos;
++				if(u >= 1.0) break;
++			}
++		}
++		else if(cmd == "calib") { MacMouse::setHeadlessCapture(true); std::lock_guard<std::mutex> l(mouse_mutex); static_cast<m2s::MouseToStick *>(mouse_m2s)->reset(); g_m2s_calib.start(m2sNow()); }
++		else if(cmd == "calstatus")
++		{
++			std::lock_guard<std::mutex> l(mouse_mutex);
++			char o[300]; snprintf(o, sizeof(o), "active=%d phase=%s ok=%d dz=%.3f wmax=%.1f latency=%.0f ramp=%.2f px_per_turn=%.1f linear=%d worst=%.3f msg=%s", g_m2s_calib.active(), g_m2s_calib.status().c_str(),
++				g_m2s_last_cal.ok, g_m2s_last_cal.deadzone, g_m2s_last_cal.wmax_deg_s, g_m2s_last_cal.latency_ms, g_m2s_last_cal.ramp_ratio, g_m2s_last_cal.px_per_turn, g_m2s_last_cal.linear, g_m2s_last_cal.curve_worst, g_m2s_last_cal.message.c_str());
++			reply = o;
++		}
++		else if(cmd == "shot" && sscanf(buf, "%*s %399s", arg) == 1) { std::lock_guard<std::mutex> l(g_m2s_test_mtx); g_m2s_shot_path = arg; g_m2s_frame_wanted = true; }
++		else if(cmd == "track" && sscanf(buf, "%*s %lf", &a1) == 1)
++		{
++			std::lock_guard<std::mutex> l(g_m2s_test_mtx);
++			g_m2s_track_on = a1 != 0; g_m2s_track_have = false; g_m2s_track_px = 0; g_m2s_track_offset = 0; g_m2s_track_frames = 0; g_m2s_track_bad = 0;
++			g_m2s_frame_wanted = g_m2s_track_on;
++		}
++		else if(cmd == "trackget")
++		{
++			std::lock_guard<std::mutex> l(g_m2s_test_mtx);
++			char o[120]; snprintf(o, sizeof(o), "%.3f %d %d", g_m2s_track_px + g_m2s_track_offset, g_m2s_track_frames, g_m2s_track_bad);
++			reply = o;
++		}
++		else if(cmd == "set" && sscanf(buf, "%*s %399s %lf", arg, &a1) == 2)
++		{
++			std::lock_guard<std::mutex> l(mouse_mutex);
++			auto *m = static_cast<m2s::MouseToStick *>(mouse_m2s);
++			std::string k = arg;
++			if(k == "resend") chiaki_feedback_sender_set_state_resend_ms((int)a1);
++			else if(k == "extra") chiaki_feedback_sender_set_extra_sends((int)a1);
++			else if(k == "qos")
++			{
++				// Ask Wi-Fi for its voice-call priority on what this Mac sends, which is mostly inputs.
++				int sock = (int)session.stream_connection.takion.sock;
++				int svc = a1 != 0 ? NET_SERVICE_TYPE_VO : NET_SERVICE_TYPE_BE, tos = a1 != 0 ? 0xB8 : 0;
++				int r1 = setsockopt(sock, SOL_SOCKET, SO_NET_SERVICE_TYPE, &svc, sizeof(svc));
++				int r2 = setsockopt(sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
++				int gs = -1, gt = -1; socklen_t ls = sizeof(gs), lt = sizeof(gt);
++				getsockopt(sock, SOL_SOCKET, SO_NET_SERVICE_TYPE, &gs, &ls); getsockopt(sock, IPPROTO_IP, IP_TOS, &gt, &lt);
++				char o[120]; snprintf(o, sizeof(o), "qos set r=%d,%d now service=%d tos=0x%x", r1, r2, gs, gt); reply = o;
++			}
++			else if(k == "tick") g_m2s_tick_ms = (int)a1;
++			else
++			if(k == "sens") m->p.deg_per_count = a1; else if(k == "window") m->p.window_ms = a1; else if(k == "wmax") m->p.wmax_deg_s = a1;
++			else if(k == "deadzone") m->p.deadzone = a1; else if(k == "nocurve") m->p.curve.clear(); else if(k == "overflow") m->p.overflow_ms = a1; else if(k == "vratio") m->p.vertical_ratio = a1; else if(k == "axispull") m->p.axis_pull_deg = a1; else if(k == "diagloss") m->p.diag_loss = a1; else if(k == "yscale") m->p.y_scale = a1; else reply = "unknown";
++		}
++		else reply = "bad command";
++		sendto(fd, reply.c_str(), reply.size(), 0, (sockaddr *)&from, fl);
++	}
++	close(fd);
++#endif
++}
++
++// Own high-priority thread: mouse updates must not wait for the UI or video drawing.
++void StreamSession::MouseThreadMain()
++{
++#ifdef Q_OS_MACOS
++	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++	using clk = std::chrono::steady_clock;
++	auto next = clk::now() + std::chrono::milliseconds(4), last = clk::now(), stat_start = last;
++	int ticks = 0; double worst = 0;
++	while(!mouse_thread_stop)
++	{
++		std::this_thread::sleep_until(next);
++		auto now = clk::now();
++		const auto period = std::chrono::milliseconds(g_m2s_tick_ms.load());
++		next += period;
++		if(next < now) next = now + period;      // fell behind: don't burst to catch up
++		double dt = std::chrono::duration<double>(now - last).count();
++		last = now;
++		worst = std::max(worst, dt);
++		ticks++;
++		std::lock_guard<std::mutex> l(mouse_mutex);
++		MouseBridgeStep(dt);
++		if(std::chrono::duration<double>(now - stat_start).count() >= 1.0)
++		{
++			unsigned ev = MacMouse::takeEventCount();
++			if(MacMouse::captured() && ev > 0)
++				fprintf(stderr, "[m2s] rate: mouse reports=%u/s bridge updates=%d/s sends=%d/s worst gap=%.0f ms | main thread=%d/s worst gap=%d ms\n",
++					ev, ticks, mouse_sends, worst * 1000, g_m2s_main_ticks.load(), g_m2s_main_gap.load());
++			ticks = 0; worst = 0; mouse_sends = 0; stat_start = now;
++			g_m2s_main_ticks = 0; g_m2s_main_gap = 0;
++		}
++	}
++#endif
++}
++
++void StreamSession::MouseBridgeStep(double dt)
++{
++#ifdef Q_OS_MACOS
++	auto *m = static_cast<m2s::MouseToStick *>(mouse_m2s);
++	ChiakiControllerState prev = mouse_state;
++	m2s::CalibResult cal;
++	if(g_m2s_calib.takeFinished(cal))
++	{
++		if(cal.ok)
++		{
++			m->p.deadzone = cal.deadzone; m->p.wmax_deg_s = cal.wmax_deg_s; m->p.curve = cal.curve;
++			g_m2s_last_cal = cal;
++			m->reset();
++			bool saved = m2s::saveConfig(m2sConfigPath(), m->p);
++			fprintf(stderr, "[m2s] CALIBRATED: deadzone %.3f, full stick %.0f deg/s%s, stick-to-picture delay %.0f ms, ramp ratio %.2f%s, saved=%d\n",
++				cal.deadzone, cal.wmax_deg_s, cal.wmax_estimated ? " (estimate)" : "", cal.latency_ms, cal.ramp_ratio,
++				cal.ramp_detected ? " RAMP-UP DETECTED: turn off Aim Ease In and Aim Smoothing, then calibrate again" : "", saved);
++			for(const auto &c : cal.curve)
++				fprintf(stderr, "[m2s]   stick %.3f -> %3.0f%% speed\n", c.stick, c.frac * 100);
++			if(!cal.message.empty())
++				fprintf(stderr, "[m2s]   note: %s\n", cal.message.c_str());
++			MacMouse::beep(1);
++		}
++		else
++		{
++			g_m2s_last_cal = cal;
++			fprintf(stderr, "[m2s] CALIBRATION FAILED: %s\n", cal.message.c_str());
++			MacMouse::beep(3);
++		}
++		chiaki_controller_state_set_idle(&mouse_state);
++		MouseSendLocked();
++		return;
++	}
++	if(g_m2s_calib.active())
++	{
++		if(!MacMouse::captured()) { g_m2s_calib.abort(); return; }
++		double ignore_x, ignore_y; MacMouse::takeDeltas(ignore_x, ignore_y);
++		mouse_state.right_x = (int16_t)std::lround(std::clamp(g_m2s_calib.stick(m2sNow()), -1.0, 1.0) * 32767.0);
++		mouse_state.right_y = 0;
++		mouse_state.r2_state = mouse_state.l2_state = 0;
++		if(mouse_state.right_x != prev.right_x || mouse_state.right_y != prev.right_y)
++			MouseSendLocked();
++		return;
++	}
++	if(!MacMouse::captured())
++	{
++		if(prev.right_x || prev.right_y || prev.l2_state || prev.r2_state || (prev.buttons & CHIAKI_CONTROLLER_BUTTON_R3))
++		{
++			m->reset();
++			chiaki_controller_state_set_idle(&mouse_state);
++			MouseSendLocked();
++		}
++		return;
++	}
++	double dx, dy; MacMouse::takeDeltas(dx, dy);
++	if(g_m2s_hold_on)
++	{
++		mouse_state.right_x = (int16_t)std::lround(g_m2s_hold_x.load() * 32767.0);
++		mouse_state.right_y = (int16_t)std::lround(-g_m2s_hold_y.load() * 32767.0);
++		if(mouse_state.right_x != prev.right_x || mouse_state.right_y != prev.right_y) MouseSendLocked();
++		return;
++	}
++	if(g_m2s_sweep)
++	{
++		g_m2s_sweep_v += dt * 0.02;   // 2% stick per second, reaction time is subtracted when it stops
++		if(g_m2s_sweep_v > 0.4) { g_m2s_sweep = false; g_m2s_sweep_v = 0; fprintf(stderr, "[m2s] DEADZONE SWEEP gave up at 40%%\n"); }
++		mouse_state.right_x = (int16_t)std::lround(g_m2s_sweep_v * 32767.0);
++		mouse_state.right_y = 0;
++		MouseSendLocked();
++		return;
++	}
++	if(g_m2s_cal_ticks > 0) { g_m2s_cal_ticks--; dx += (g_m2s_cal_frac * m->p.wmax_deg_s * 4.0 / m->p.deg_per_count) / 1000.0; }   // 4 s spin at a fixed fraction of full stick
++	m->addDelta(dx, dy);
++	m2s::Stick s = m->tick(dt);
++	g_m2s_ring[g_m2s_ring_n++ % 2600] = {m2sNow(), dx, dy, s.x, s.y};
++	unsigned b = MacMouse::buttons();
++	mouse_state.right_x = (int16_t)std::lround(std::clamp(s.x, -1.0, 1.0) * 32767.0);
++	mouse_state.right_y = (int16_t)std::lround(std::clamp(-s.y, -1.0, 1.0) * 32767.0);   // PS: up is negative
++	mouse_state.r2_state = (b & 1) ? 0xff : 0;
++	mouse_state.l2_state = (b & 2) ? 0xff : 0;
++	if(b & 4) mouse_state.buttons |= CHIAKI_CONTROLLER_BUTTON_R3; else mouse_state.buttons &= ~CHIAKI_CONTROLLER_BUTTON_R3;
++	if(mouse_state.right_x != prev.right_x || mouse_state.right_y != prev.right_y || mouse_state.r2_state != prev.r2_state ||
++	   mouse_state.l2_state != prev.l2_state || mouse_state.buttons != prev.buttons)
++		MouseSendLocked();
++#endif
++}
++
+ void StreamSession::HandleKeyboardEvent(QKeyEvent *event)
+ {
++#ifdef Q_OS_MACOS
++	if(event->type() == QEvent::KeyPress && !event->isAutoRepeat() && mouse_m2s)
++	{
++		std::lock_guard<std::mutex> mouse_lock(mouse_mutex);
++		auto *m = static_cast<m2s::MouseToStick *>(mouse_m2s);
++		bool changed = true;
++		switch(event->key())
++		{
++			case Qt::Key_section:     // § key (Nordic layout, under Esc)
++			case Qt::Key_QuoteLeft:   // ` (US layout)
++			case Qt::Key_AsciiTilde:
++			case Qt::Key_F8:  MacMouse::setCapture(!MacMouse::captured()); changed = false;
++				fprintf(stderr, "[m2s] mouse bridge: %s\n", MacMouse::captured() ? "CAPTURED (` to release)" : "released"); break;
++			case Qt::Key_Less:
++			case Qt::Key_Greater: {
++				static const double fr[] = {0.25, 0.5, 0.75, 1.0};
++				g_m2s_cal_frac = fr[g_m2s_cal_level++ % 4]; g_m2s_cal_ticks = 1000; changed = false;
++				fprintf(stderr, "[m2s] TEST SPIN %.0f%% stick: expecting %.2f full turns over 4 s\n", g_m2s_cal_frac * 100, g_m2s_cal_frac * m->p.wmax_deg_s * 4 / 360.0);
++				break; }
++			case Qt::Key_J: m->p.window_ms = std::max(16.0, m->p.window_ms - 8); break;   // j  less delay
++			case Qt::Key_K: m->p.window_ms = std::min(64.0, m->p.window_ms + 8); break;   // k  steadier
++			case Qt::Key_B:           // b  start or cancel the automatic calibration
++				changed = false;
++				if(g_m2s_calib.active()) g_m2s_calib.abort();
++				else
++				{
++					MacMouse::setCapture(true);
++					g_m2s_sweep = false; g_m2s_cal_ticks = 0; m->reset();
++					g_m2s_calib.start(m2sNow());
++					fprintf(stderr, "[m2s] CALIBRATION started\n");
++				}
++				break;
++			case Qt::Key_1:
++			case Qt::Key_L: {
++				// "that just hitched": save the last 10 seconds. Being a second or two late is fine.
++				changed = false;
++				double now = m2sNow(), ep = m2sEpoch();
++				QString dir = QDir::homePath() + "/Library/Application Support/m2s-bridge/hitches";
++				QDir().mkpath(dir);
++				std::string path = (dir + QString("/hitch_%1.txt").arg((qint64)ep)).toStdString();
++				if(FILE *o = fopen(path.c_str(), "w"))
++				{
++					long n = std::min<long>(g_m2s_ring_n, 2600);
++					fprintf(o, "mark %.4f\n", now);
++					for(long i = g_m2s_ring_n - n; i < g_m2s_ring_n; i++)
++					{
++						const M2sTick &k = g_m2s_ring[i % 2600];
++						fprintf(o, "in %.4f %.1f %.1f %.4f %.4f\n", k.t, k.dx, k.dy, k.sx, k.sy);
++					}
++					std::lock_guard<std::mutex> tl(g_m2s_test_mtx);
++					for(const auto &v : g_m2s_seen) if(v.t > now - 10.5) fprintf(o, "seen %.4f %.3f %.3f\n", v.t, v.a, v.b);
++					fclose(o);
++				}
++				fprintf(stderr, "[m2s] HITCH MARK saved %s\n", path.c_str()); fflush(stderr);
++				MacMouse::beep(1);
++				break; }
++			case Qt::Key_N: m->p.curve.clear(); m->p.deadzone = std::max(0.0, m->p.deadzone - 0.01); break;   // n  deadzone down (camera hops)
++			case Qt::Key_M: m->p.curve.clear(); m->p.deadzone = std::min(0.4, m->p.deadzone + 0.01); break;   // m  deadzone up (small moves ignored)
++			case Qt::Key_Apostrophe:
++				changed = false;
++				if(!g_m2s_sweep) { g_m2s_sweep = true; g_m2s_sweep_v = 0; m->reset(); fprintf(stderr, "[m2s] DEADZONE SWEEP started\n"); }
++				else { g_m2s_sweep = false; m->p.curve.clear(); m->p.deadzone = std::max(0.0, g_m2s_sweep_v - 0.005); m2s::saveConfig(m2sConfigPath(), m->p); fprintf(stderr, "[m2s] DEADZONE measured: %.3f\n", m->p.deadzone); }
++				break;
++			case Qt::Key_Minus:        m->p.deg_per_count /= 1.15; break;   // -  sens down
++			case Qt::Key_Plus:         m->p.deg_per_count *= 1.15; break;   // +  sens up
++			case Qt::Key_Comma:        m->p.wmax_deg_s = std::max(60.0, m->p.wmax_deg_s - 10); break;  // ,  camera speed down
++			case Qt::Key_Period:       m->p.wmax_deg_s += 10; break;        // .  camera speed up
++			default: changed = false;
++		}
++		if(changed)
++			m2s::saveConfig(m2sConfigPath(), m->p);
++		if(changed)
++			fprintf(stderr, "[m2s] sens %.4f deg/count, wmax %.0f deg/s, deadzone %.3f, window %.0f ms\n", m->p.deg_per_count, m->p.wmax_deg_s, m->p.deadzone, m->p.window_ms);
++	}
++#endif
+ 	if(!keyboard_controller_enabled)
+ 		return;
+ 	if(key_map.contains(Qt::Key(event->key())) == false)
+@@ -966,30 +1615,15 @@ void StreamSession::HandleKeyboardEvent(QKeyEvent *event)
+ 		case CHIAKI_CONTROLLER_ANALOG_BUTTON_R2:
+ 			keyboard_state.r2_state = press_event ? 0xff : 0;
+ 			break;
+-		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_RIGHT_Y_UP):
+-			keyboard_state.right_y = press_event ? -0x7fff : 0;
+-			break;
+-		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_RIGHT_Y_DOWN):
+-			keyboard_state.right_y = press_event ? 0x7fff : 0;
+-			break;
+-		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_RIGHT_X_UP):
+-			keyboard_state.right_x = press_event ? 0x7fff : 0;
+-			break;
+-		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_RIGHT_X_DOWN):
+-			keyboard_state.right_x = press_event ? -0x7fff : 0;
+-			break;
+-		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_LEFT_Y_UP):
+-			keyboard_state.left_y = press_event ? -0x7fff : 0;
+-			break;
+-		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_LEFT_Y_DOWN):
+-			keyboard_state.left_y = press_event ? 0x7fff : 0;
+-			break;
+-		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_LEFT_X_UP):
+-			keyboard_state.left_x = press_event ? 0x7fff : 0;
+-			break;
+-		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_LEFT_X_DOWN):
+-			keyboard_state.left_x = press_event ? -0x7fff : 0;
+-			break;
++		// Held keys are tracked so opposite keys never cancel: newest wins, release falls back.
++		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_RIGHT_Y_UP):   g_m2s_keys.set(m2s::DirKeys::RightNeg_Y, press_event); keyboard_state.right_y = 0x7fff * g_m2s_keys.axis(m2s::DirKeys::RightNeg_Y, m2s::DirKeys::RightPos_Y); break;
++		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_RIGHT_Y_DOWN): g_m2s_keys.set(m2s::DirKeys::RightPos_Y, press_event); keyboard_state.right_y = 0x7fff * g_m2s_keys.axis(m2s::DirKeys::RightNeg_Y, m2s::DirKeys::RightPos_Y); break;
++		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_RIGHT_X_UP):   g_m2s_keys.set(m2s::DirKeys::RightPos_X, press_event); keyboard_state.right_x = 0x7fff * g_m2s_keys.axis(m2s::DirKeys::RightNeg_X, m2s::DirKeys::RightPos_X); break;
++		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_RIGHT_X_DOWN): g_m2s_keys.set(m2s::DirKeys::RightNeg_X, press_event); keyboard_state.right_x = 0x7fff * g_m2s_keys.axis(m2s::DirKeys::RightNeg_X, m2s::DirKeys::RightPos_X); break;
++		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_LEFT_Y_UP):    g_m2s_keys.set(m2s::DirKeys::LeftNeg_Y, press_event); keyboard_state.left_y = 0x7fff * g_m2s_keys.axis(m2s::DirKeys::LeftNeg_Y, m2s::DirKeys::LeftPos_Y); break;
++		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_LEFT_Y_DOWN):  g_m2s_keys.set(m2s::DirKeys::LeftPos_Y, press_event); keyboard_state.left_y = 0x7fff * g_m2s_keys.axis(m2s::DirKeys::LeftNeg_Y, m2s::DirKeys::LeftPos_Y); break;
++		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_LEFT_X_UP):    g_m2s_keys.set(m2s::DirKeys::LeftPos_X, press_event); keyboard_state.left_x = 0x7fff * g_m2s_keys.axis(m2s::DirKeys::LeftNeg_X, m2s::DirKeys::LeftPos_X); break;
++		case static_cast<int>(ControllerButtonExt::ANALOG_STICK_LEFT_X_DOWN):  g_m2s_keys.set(m2s::DirKeys::LeftNeg_X, press_event); keyboard_state.left_x = 0x7fff * g_m2s_keys.axis(m2s::DirKeys::LeftNeg_X, m2s::DirKeys::LeftPos_X); break;
+ 		default:
+ 			if(press_event)
+ 				keyboard_state.buttons |= button;
+@@ -1317,7 +1951,7 @@ void StreamSession::DpadSendFeedbackState()
+ 			dpad_touch_stop_timer->start(NEW_DPAD_TOUCH_INTERVAL_MS);
+ 	}
+ 	chiaki_controller_state_or(&state, &state, &dpad_touch_state);
+-	chiaki_session_set_controller_state(&session, &state);
++	MouseMergeAndSend(&state);
+ }
+ 
+ void StreamSession::SendFeedbackState()
+@@ -1373,7 +2007,7 @@ void StreamSession::SendFeedbackState()
+ 			dpad_touch_stop_timer->start(NEW_DPAD_TOUCH_INTERVAL_MS);
+ 	}
+ 	chiaki_controller_state_or(&state, &state, &dpad_touch_state);
+-	chiaki_session_set_controller_state(&session, &state);
++	MouseMergeAndSend(&state);
+ }
+ 
+ void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
+diff --git a/lib/src/feedbacksender.c b/lib/src/feedbacksender.c
+index 817544a..8044f5f 100644
+--- a/lib/src/feedbacksender.c
++++ b/lib/src/feedbacksender.c
+@@ -1,12 +1,21 @@
+ // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
+ 
+ #include <chiaki/feedbacksender.h>
++#ifndef _WIN32
++#include <unistd.h>
++#endif
+ #include <chiaki/time.h>
+ 
+ #include <string.h>
+ 
+ #define FEEDBACK_STATE_TIMEOUT_MIN_MS 8 // minimum time to wait between sending 2 packets
+-#define FEEDBACK_STATE_TIMEOUT_MAX_MS 200 // maximum time to wait between sending 2 packets
++// Maximum time to wait between sending 2 packets. Settable: a lost "stick back to zero" otherwise lasts this long.
++static volatile int feedback_state_timeout_max_ms = 200;
++#define FEEDBACK_STATE_TIMEOUT_MAX_MS ((uint64_t)feedback_state_timeout_max_ms)
++CHIAKI_EXPORT void chiaki_feedback_sender_set_state_resend_ms(int ms) { feedback_state_timeout_max_ms = ms; }
++// Send every stick update this many extra times, a moment apart, so one lost packet doesn't cost the update.
++static volatile int feedback_state_extra_sends = 0;
++CHIAKI_EXPORT void chiaki_feedback_sender_set_extra_sends(int n) { feedback_state_extra_sends = n; }
+ 
+ #define FEEDBACK_HISTORY_BUFFER_SIZE 0x10
+ // Number of most recent events repeated in every history packet.
+@@ -162,6 +171,13 @@ static void feedback_sender_send_state(ChiakiFeedbackSender *feedback_sender, co
+ 	ChiakiErrorCode err = chiaki_takion_send_feedback_state(feedback_sender->takion, feedback_sender->state_seq_num++, &feedback_state);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 		CHIAKI_LOGE(feedback_sender->log, "FeedbackSender failed to send Feedback State");
++	for(int i = 0; i < feedback_state_extra_sends; i++)
++	{
++#ifndef _WIN32
++		usleep(1500);
++#endif
++		chiaki_takion_send_feedback_state(feedback_sender->takion, feedback_sender->state_seq_num++, &feedback_state);
++	}
+ }
+ 
+ static void feedback_sender_send_history_packet(ChiakiFeedbackSender *feedback_sender, ChiakiSeqNum16 seq_num, uint8_t event_count, const uint8_t *buf, size_t buf_size)
