@@ -1,254 +1,197 @@
-<div align="center">
+# ⚡ Nullwire
 
-# ⚡ NULLWIRE
+> *"Why are we spending $250 on plastic USB dongles that get banned every few months, just to use a mouse on a console?"*
 
-**Zero-Hardware, Sub-Millisecond Input Bridge & Optical Ballistics Engine for PlayStation 5**
+**Nullwire** is an open-source project that replaces physical console adapters (like XIM or Cronus) with pure code, sub-millisecond math, and an automated computer-vision feedback loop. 
 
-[![Language](https://img.shields.io/badge/Language-C%2B%2B17%20%2F%20Objective--C%2B%2B-blue.svg)](#)
-[![Protocol](https://img.shields.io/badge/Protocol-Sony%20Remote%20Play%20(Takion%20UDP)-orange.svg)](#)
-[![Latency](https://img.shields.io/badge/Wire%20Latency-%3C0.5ms%20(LAN)-green.svg)](#)
-[![Hardware](https://img.shields.io/badge/Hardware%20Required-%240%20(Zero%20Adapters)-brightgreen.svg)](#)
-[![Status](https://img.shields.io/badge/Status-Prototype%20Verified-blueviolet.svg)](#)
-
-*Eliminating physical hardware adapters forever. 1:1 raw mouse translation directly into the PS5 OS kernel via native encrypted LAN streaming.*
-
-</div>
+This is the story of how it works, the physics rabbit hole of turning a mouse into a joystick, and how we got a computer to calibrate its own aim by watching its own screen.
 
 ---
 
-## 👁️ The Vision
+## 📖 The Journey
 
-For over a decade, console mouse-and-keyboard adapters have been trapped in a flawed hardware paradigm:
-- **Fragile USB Dongles:** Devices like XIM, Cronus, and Beloader cost $150–$300, require third-party bypass controllers, and are constantly bricked or banned by console firmware updates.
-- **Hardware Bottlenecks:** Physical USB bridges introduce polling jitter, translation latency, and cabling clutter.
-- **The Display vs. Input Dilemma:** Players assumed streaming protocols were unusable for competitive play due to video encoding latency.
+### Act 1: The $250 Dongle Tax
 
-**Nullwire shatters this paradigm.**
+If you want to play games on a PlayStation 5 with a mouse and keyboard, the market gives you a frustrating choice:
 
-Instead of plugging hardware into the console, Nullwire turns any local computer into an invisible, ultra-low-latency **virtual DualSense controller** communicating directly with the PS5 over local Ethernet. 
+1. Buy a $150–$300 hardware box (XIM Matrix, Cronus Zen, Beloader).
+2. Plug an extra DualSense controller into it to trick the PS5’s cryptographic security handshake.
+3. Deal with a bird's nest of USB cables and constant input jitter.
+4. Pray that the next Sony system update doesn't detect the USB hardware ID and brick your setup.
 
-> [!IMPORTANT]
-> **The Dual-Path Split Architecture:**
-> 1. **Visuals (0ms lag):** Your monitor remains plugged directly into the **PS5 HDMI 2.1 port** (4K @ 120Hz HDR, VRR).
-> 2. **Input (<0.5ms transit):** Your raw 1000Hz mouse input is processed on your host machine, shaped by an optical-calibrated ballistics engine, and injected over UDP into the PS5 OS as native, cryptographically authenticated Remote Play controller packets.
+We looked at this and asked a simple question: **Why are we buying physical hardware to solve a digital problem?**
 
 ---
 
-## 🏛️ System Architecture
+### Act 2: The "Aha!" Moment — The Invisible Controller
+
+Sony built a feature directly into the PS5 that most people take for granted: **Remote Play**.
+
+When you connect to your PS5 through Remote Play, the console doesn't ask for a physical controller. It accepts encrypted controller packets over your local Wi-Fi or Ethernet. **To the PS5 operating system, Remote Play is a 100% genuine, authorized controller.** There is no hardware authentication chip to spoof and no risk of USB device bans.
+
+*"Wait,"* you might say, *"isn't Remote Play laggy?"*
+
+That’s where our breakthrough hit us: **Nobody said you have to look at the Remote Play stream.**
 
 ```
-                                  ┌────────────────────────────────────────┐
-                                  │           PHYSICAL DISPLAY             │
-                                  │    Gaming Monitor / OLED TV (HDMI)     │
-                                  └───────────────────▲────────────────────┘
-                                                      │
-                                           Zero-Lag HDMI 2.1 (4K 120Hz)
-                                                      │
-┌──────────────────────────────┐              ┌───────┴────────┐
-│        HOST MACHINE          │              │                │
-│    (Mac / Linux / PC)        │              │     SONY       │
-│                              │              │  PLAYSTATION 5 │
-│  ┌────────────────────────┐  │              │                │
-│  │    Raw Mouse Event     │  │              │                │
-│  │ (1000Hz GCMouse/IOHID) │  │              │                │
-│  └───────────┬────────────┘  │              │                │
-│              ▼               │              │                │
-│  ┌────────────────────────┐  │              │                │
-│  │  M2S Ballistics Engine │  │              │                │
-│  │   - Payout Window Queue│  │              │                │
-│  │   - Anti-Deadzone (0.1)│  │              │                │
-│  │   - Y/X Scaling (0.71) │  │              │                │
-│  │   - Flick Saturation   │  │              │                │
-│  └───────────┬────────────┘  │              │                │
-│              ▼               │              │                │
-│  ┌────────────────────────┐  │              │                │
-│  │  Takion UDP Dispatcher │  │              │                │
-│  │ (250Hz Controller Loop)│──┼──────────────┼─▶ Remote Play  │
-│  └───────────▲────────────┘  │ Sub-ms Wire  │   Input Stack  │
-│              │               │ (Direct LAN) │   (Native OS)  │
-│  ┌───────────┴────────────┐  │              │                │
-│  │ 2D Optical Flow Tracker│◀─┼──────────────┼── Video Frames │
-│  │ (Self-Calibrating CV)  │  │   (UDP 360p  │   (Streamed)   │
-│  └────────────────────────┘  │  Calibration)│                │
-└──────────────────────────────┘              └────────────────┘
+   ┌────────────────────────────────────────────────────────┐
+   │                    YOUR TV / MONITOR                   │
+   │               (Zero Display Lag • 4K @ 120Hz)          │
+   └───────────────────────────▲────────────────────────────┘
+                               │
+                     Direct PS5 HDMI Cable
+                               │
+   ┌───────────────────────────┴────────────┐
+   │             PLAYSTATION 5              │
+   └───────────────────────────▲────────────┘
+                               │
+               Local LAN Cable │ (< 0.5ms packet transit)
+                               │
+   ┌───────────────────────────┴────────────┐
+   │              YOUR COMPUTER             │
+   │       (Mac / Linux / Windows PC)       │
+   │                                        │
+   │  • Mouse plugged in here               │
+   │  • Translates mouse deltas to sticks   │
+   │  • Fires UDP packets over LAN to PS5   │
+   └────────────────────────────────────────┘
 ```
+
+You leave your gaming monitor plugged directly into the **PS5 HDMI port** for zero-latency, 120Hz HDR gameplay. 
+
+Your computer simply sits on your desk, captures your mouse, translates the motion into DualSense controller packets, and sends them over a local Ethernet cable in **less than 0.5 milliseconds**. 
+
+Zero extra hardware. $0 spent.
 
 ---
 
-## 🧠 The Mathematics: Mouse to Stick Ballistics
+### Act 3: The Physics Trap (Why Mouse-to-Stick Feels Like Ice)
 
-A physical mouse commands **spatial displacement** ($\Delta \theta$). A gamepad thumbstick commands **angular velocity** ($\omega = \frac{d\theta}{dt}$). Converting a mouse into a stick without feeling like "aiming on ice" requires solving four fundamental nonlinear distortions.
+Once we had the bridge working, we ran into the wall that has plagued console emulation for 15 years: **Translating a mouse to a thumbstick is fundamentally unnatural.**
 
-### 1. The Fixed Payout Window (No Exponential Tails)
-Naive converters use exponential decay filters ($\Delta x \cdot e^{-t/\tau}$). When mouse movement stops, an exponential tail leaves the virtual stick resting at the deadzone edge for up to 150ms—causing noticeable camera drift ("creep").
+Think about the physics:
+* **A mouse commands *position*:** If you move your hand 2 inches to the right, you expect your crosshair to move exactly that far and immediately stop.
+* **A thumbstick commands *speed*:** A stick is like the gas pedal in a car. Push it right, and your camera turns continuously at a set speed until you let go.
 
-Nullwire models each mouse count as an exact angular quanta $\Delta \theta = \text{counts} \times S_{\text{deg}}$, paid out linearly over a strict window $T_w \approx 32\text{ ms}$:
-$$\omega(t) = \frac{1}{T_w} \sum_{i} \Delta\theta_i \quad \text{for } t \in [t_i, t_i + T_w]$$
-When the window expires, the stick returns to **absolute zero** within one frame.
+If you connect a mouse to a stick naively, it feels awful. Here is why:
 
-### 2. Saturating Flick Integrator
-A mouse flick can demand instantaneous turns exceeding $1500^\circ/\text{s}$, but console game engines enforce a hard turn-rate limit $\omega_{\max}$ (typically $360^\circ - 720^\circ/\text{s}$). 
-* Naive converters clip this velocity, discarding up to 60% of flick distance.
-* Nullwire integrates excess velocity into a **flick reservoir**, holding the stick at maximum saturation ($1.0$) for exactly:
-  $$t_{\text{flick}} = \frac{\Delta \theta_{\text{excess}}}{\omega_{\max}}$$
-  The entire flick rotation is preserved without dropping distance.
+#### 1. The Deadzone Problem
+Every game ignores tiny stick movements so your camera doesn't drift when you let go of the controller. If your game has a 10% deadzone, your first subtle mouse nudges do literally nothing.
 
-### 3. Vertical Aspect Ratio & Diagonal Normalization
-Games intentionally dampen vertical pitch speed compared to horizontal yaw speed to keep horizons level. Nullwire pre-compensates using empirical video calibration:
-$$\text{Ratio} = \frac{\omega_{\text{pitch}}}{\omega_{\text{yaw}}} \approx 0.711$$
-$$\vec{S}_{\text{corrected}} = \begin{bmatrix} S_x \\ S_y \times \frac{1}{\text{Ratio}} \end{bmatrix}$$
-Without this compensation, a 45° diagonal mouse flick lands at 36.3° in-game (an 8.7° error). With Nullwire, diagonal movement remains isotropic (1:1).
+#### 2. The "Creep" Bug (The Exponential Tail)
+Most software tries to smooth stick movement using a decay curve (exponential decay). But as the movement decays, the virtual stick lingers right on the edge of the game's deadzone for an extra 150 milliseconds. The result? You stop your mouse, but your crosshair keeps slowly "creeping" across the screen.
 
-### 4. Inner Deadzone Nullification
-Every engine has an inner deadzone $D_z$ below which stick input produces zero angular motion. Nullwire remaps the active range $[0, 1]$ directly past the deadzone threshold:
-$$S_{\text{out}} = \text{sgn}(S) \cdot \left[ D_z + (1 - D_z) \cdot |S| \right]$$
+#### 3. The Flick Wall (The Speed Limit)
+A human can whip a mouse across a pad in 40 milliseconds. But console games enforce a hard speed limit on turn speed (usually around 360° per second). If you flick faster than the stick can turn, naive converters simply discard the rest of your motion. You wanted a 90° flick; you got 50°.
 
 ---
 
-## 🔬 Closed-Loop Optical Flow Tracker (`Tracker2D`)
+### Act 4: The Math That Solved It
 
-Rather than guessing game parameters, Nullwire includes an embedded computer vision engine that measures camera motion directly from video stream keyframes:
+Inside [`include/mouse_to_stick.h`](file:///Users/Manteh/Nullwire/include/mouse_to_stick.h), we wrote a pure mathematical ballistics model that fixes all three issues:
+
+1. **The Strict Payout Window:** Instead of an exponential curve that lingers, every mouse count is converted to an exact angle and paid out over a fixed, tight window (e.g. 32 milliseconds). The moment that window finishes, the stick snaps to **absolute zero**. Zero camera creep.
+2. **The Saturating Flick Reservoir:** When you flick faster than the game’s maximum turn rate ($\omega_{\max}$), we don’t throw the extra movement away. We store it in a reservoir, hold the stick at 100% deflection, and hold it just long enough for the camera to finish your intended turn. Your 90° flick lands at 90° every single time.
+3. **Deadzone Cancellation:** We inject an anti-deadzone offset that instantly boots the stick past the game’s dead zone the moment the mouse moves a single count.
+
+---
+
+### Act 5: Teaching the Computer to See
+
+We thought our math was complete—until we tested it. We had made guesses:
+* *"Let's assume the deadzone is 10%."*
+* *"Let's assume vertical sensitivity is 80% of horizontal."*
+
+Our measuring tools fooled us twice in one evening. So we asked: **Why are we guessing when the computer has eyes?**
+
+Because Chiaki receives the Remote Play video stream, our computer has access to the actual game screen 60 times a second. We built a real-time **optical computer vision tracker** ([`include/m2s_track2d.h`](file:///Users/Manteh/Nullwire/include/m2s_track2d.h)) directly into the system.
 
 ```
-Video Frame (320x180) ──▶ Spatial Masking (Cut HUD & Weapon) ──▶ Coarse Search (1/4 Scale) ──▶ Fine Sub-Pixel SAD Fit
+Incoming 60fps Frame ──▶ Mask HUD & Weapon ──▶ Coarse Search (1/4 scale) ──▶ Sub-Pixel Parabolic Fit
 ```
 
-- **Masking:** Strips HUD indicators, weapon models, and screen peripheries to measure purely the 3D world background.
-- **Hierarchical Block Matching:** Coarse SAD (Sum of Absolute Differences) at $4\times4$ downsampling, followed by full-resolution fine search.
-- **Sub-Pixel Parabolic Fit:** Interpolates between pixel boundaries to achieve sub-0.1 pixel tracking accuracy:
-  $$\delta = \frac{1}{2} \cdot \frac{L - R}{L - 2C + R}$$
+* It masks out the HUD and weapon model so only the 3D environment is tracked.
+* It performs coarse-to-fine block matching against reference frames.
+* It uses parabolic interpolation to measure camera motion down to **fractions of a pixel**.
 
-### Real Empirical Calibration Data (PS5 In-Engine Test Run)
+Then, we wrote a test script ([`scripts/axes.py`](file:///Users/Manteh/Nullwire/scripts/axes.py)) that took control of the PS5, moved the stick at exact increments, and logged where the camera really went.
 
-Data collected via `scripts/axes.py` running against a live PS5 target:
+---
+
+### Act 6: The Ground Truth (What the Camera Saw)
+
+Here is the actual measurement output from our PS5 session:
 
 ```text
 stick x   stick y |  yaw deg/s  pitch deg/s |  direction want / got
   0.500   0.000  |     170.6        -0.5   |     0.0 /    -0.2
-  0.300   0.000  |      82.1         2.4   |     0.0 /     1.7
   0.000   0.500  |       4.4       121.4   |    90.0 /    87.9
-  0.000  -0.500  |     -11.0      -142.1   |   -90.0 /   -94.4
-  0.354   0.354  |     131.1        96.3   |    45.0 /    36.3   <-- 8.7° diagonal skew uncorrected
-  0.110   0.000  |       4.9         0.4   |     0.0 /     4.4   <-- Past deadzone
-  0.090   0.000  |      -0.0         0.0   |     0.0 /     nan   <-- Inside deadzone
+  0.354   0.354  |     131.1        96.3   |    45.0 /    36.3  <-- The Diagonal Trap!
+  0.110   0.000  |       4.9         0.4   |     0.0 /     4.4  <-- Moving
+  0.090   0.000  |      -0.0         0.0   |     0.0 /     nan  <-- Deadzone!
 ```
 
-* **Deadzone Identified:** Exactly `0.100` (10%).
-* **True Pitch/Yaw Ratio:** $121.4 / 170.6 = \mathbf{0.711}$ (replacing arbitrary manual estimates).
-* **True Max Angular Velocity:** $\omega_{\max} = 365.0^\circ/\text{s}$.
+Look at what this revealed:
+1. **The Deadzone is exactly `0.100` (10%):** At 0.090 stick deflection, the camera had 0.0 deg/s movement. At 0.110, it moved at 4.9 deg/s.
+2. **The Vertical Ratio is `0.711`, not `0.8`:** Horizontal speed at 0.5 stick was 170.6 deg/s; vertical speed was only 121.4 deg/s. Our previous guess of 0.8 had been overshooting vertical aim by 12%!
+3. **The Diagonal Trap:** When we pushed the stick diagonally at 45° (`0.354, 0.354`), the in-game camera only moved at **36.3°**. That is an **8.7° aiming error** caused by the game dampening vertical pitch!
 
-### Visual Verification: The Circle Closure Test
+#### The Ultimate Test: Drawing Circles
+With our optical tracker feeding data into our ballistics engine, we ran [`scripts/circles.py`](file:///Users/Manteh/Nullwire/scripts/circles.py). We instructed the mouse to draw mathematically perfect circles, and watched how closely the game camera matched:
 
-Using `scripts/circles.py`, the mouse drew mathematically perfect circles in-game. The camera's path was tracked and compared to first-and-last frame alignment:
-
-| Circle Test | Radius | deg/s | Old Error (Ended Off) | Nullwire Corrected |
+| Test Name | Radius | Turn Rate | Before Calibration | Nullwire (Calibrated) |
 | :--- | :---: | :---: | :---: | :---: |
-| **Tiny Slow** | 3° | 8°/s | 0.2° | **0.0°** (Perfect loop) |
-| **Small Slow** | 5° | 10°/s | 0.1° | **0.5°** |
-| **Small Quick** | 5° | 39°/s | 0.4° | **0.2°** |
-| **Medium Medium**| 10° | 42°/s | 0.3° | **0.5°** |
-| **Big Fast** | 20° | 251°/s| 4.2° | **3.5°** |
+| **Tiny Slow** | 3° | 8°/s | 0.2° error | **0.0° error** (Closed loop) |
+| **Small Slow** | 5° | 10°/s | 0.1° error | **0.5° error** |
+| **Small Quick** | 5° | 39°/s | 0.4° error | **0.2° error** |
+| **Medium Medium**| 10° | 42°/s | 0.3° error | **0.5° error** |
 
-*(Inspect interactive vector trajectories in [`docs/circles.html`](docs/circles.html)).*
-
----
-
-## ⚡ Comparison: Nullwire vs. Hardware Adapters
-
-| Metric / Feature | Physical Adapters (XIM Matrix, Cronus Zen) | Nullwire Bridge |
-| :--- | :--- | :--- |
-| **Hardware Cost** | $150 – $300 + bypass controller | **$0** (Free, open source) |
-| **Bypass Stability** | High ban/block risk (Sony USB patches) | **Permanent** (Official Remote Play channel) |
-| **Input Delivery** | USB polling jitter | Direct 250Hz UDP stream (<0.5ms wire transit) |
-| **Video Latency** | None (HDMI direct) | **None** (HDMI direct to display) |
-| **Calibration** | Manual trial-and-error slider tuning | **Automated Computer Vision Closed-Loop** |
-| **Platform** | Proprietary closed box | Native C++ / Objective-C / Cross-platform |
+*(You can open [`docs/circles.html`](file:///Users/Manteh/Nullwire/docs/circles.html) in your browser to inspect the interactive SVG paths).*
 
 ---
 
-## 📂 Repository Structure
+## 🛠️ How It’s Organized
 
-```
-Nullwire/
-├── include/
-│   ├── mouse_to_stick.h    # Core header-only mathematical ballistics engine
-│   ├── m2s_calib.h         # Automated closed-loop calibration state machine
-│   ├── m2s_track2d.h       # Optical flow 2D block-matching tracker
-│   ├── m2s_keys.h          # Keyboard-to-DualSense digital mappings
-│   └── macMouseBridge.h    # High-rate raw mouse capture interface
-├── src/
-│   └── macMouseBridge.mm   # macOS GameController (GCMouse) unaccelerated capture
-├── tests/
-│   ├── selftest.cpp        # Unit tests for ballistics queue & payout
-│   ├── tracktest.cpp       # Unit tests for 2D optical tracker
-│   ├── calibtest.cpp       # Simulated camera calibration test runner
-│   ├── sim3d.mm            # 3D SceneKit camera simulator
-│   └── m2s_test.mm         # Interactive test harness
-├── scripts/
-│   ├── axes.py             # 2D stick response mapper & visualizer
-│   ├── circles.py          # Mouse circle tracking & loop-closure test
-│   ├── flicks.py           # High-speed flick saturation test
-│   └── ready.py            # Automated test readiness checks
-├── patches/
-│   └── chiaki-ng-m2s.patch # Production patch for chiaki-ng Remote Play stack
-├── docs/
-│   └── circles.html        # Interactive SVG comparison visualizer
-├── Makefile                # Build system for tests and harnesses
-└── README.md
-```
+* **[`include/mouse_to_stick.h`](file:///Users/Manteh/Nullwire/include/mouse_to_stick.h):** Header-only C++ ballistics engine. Manages the payout queue, flick accumulator, deadzone clearing, and diagonal normalization. Zero dependencies.
+* **[`include/m2s_track2d.h`](file:///Users/Manteh/Nullwire/include/m2s_track2d.h):** The 2D optical tracker. Compares video frames, rejects HUD noise, and measures real sub-pixel camera displacement.
+* **[`include/m2s_calib.h`](file:///Users/Manteh/Nullwire/include/m2s_calib.h):** Automated calibration state machine. Sweeps deadzones, tests response curves, and measures full-turn speeds.
+* **[`include/macMouseBridge.h`](file:///Users/Manteh/Nullwire/include/macMouseBridge.h) / [`src/macMouseBridge.mm`](file:///Users/Manteh/Nullwire/src/macMouseBridge.mm):** Low-level macOS `GCMouse` driver that reads raw, unaccelerated mouse counts directly from hardware.
+* **[`patches/chiaki-ng-m2s.patch`](file:///Users/Manteh/Nullwire/patches/chiaki-ng-m2s.patch):** The complete patch for `chiaki-ng` that adds the input bridge, packet resend logic (preventing lost UDP packets from getting stuck), and the IPC test socket.
+* **[`scripts/`](file:///Users/Manteh/Nullwire/scripts/):** Python test scripts (`axes.py`, `circles.py`, `flicks.py`) for automated bench testing.
 
 ---
 
-## 🚀 Quickstart & Building
+## 🚀 Running the Tests
 
-### Prerequisites
-* macOS 12+ or Linux / Windows (macOS test harnesses require `Cocoa`, `GameController`, and `SceneKit`).
-* `clang++` or `g++` with C++17 support.
-* Python 3.8+ (for optical test scripts).
-
-### Building the Test Suite
+You can build and run the standalone simulation test suite right now without needing a PS5:
 
 ```bash
 git clone https://github.com/Manteh/nullwire.git
 cd nullwire
 
-# Build all test binaries
+# Build the test suite
 make
 
-# Run the complete test suite (selftest, tracktest, calibtest)
+# Run the automated ballistics and computer-vision tests
 make test
 ```
 
-### Applying the Chiaki Bridge Patch
-
-To build the integrated input bridge with Chiaki-ng:
-
-```bash
-git clone https://github.com/streetpea/chiaki-ng.git
-cd chiaki-ng
-git apply /path/to/nullwire/patches/chiaki-ng-m2s.patch
-
-cmake -B build -DCHIAKI_GUI=ON
-cmake --build build -j$(sysctl -n hw.ncpu)
-```
-
-Run in headless/low-bitrate mode:
-```bash
-M2S_STREAM=360 ./build/gui/chiaki.app/Contents/MacOS/chiaki stream "PS5-Manteh" 192.168.50.182
-```
+You’ll see the engine test itself against simulated games (linear response curves, exponential response curves, and dual-zone games) and verify that the calibration engine converges on the exact deadzone and turn rate every time.
 
 ---
 
-## 🗺️ Roadmap to `v1.0` (The Standalone Daemon)
+## 🗺️ What’s Next: The Standalone Daemon
 
-- [x] **Phase 1: Core Mathematical Engine** — Windowed payout queue, saturation integrator, deadzone nullification.
-- [x] **Phase 2: Closed-Loop Optical Tracker** — Real-time frame block matching, sub-pixel fit, and empirical calibration.
-- [x] **Phase 3: Chiaki-ng Integration Patch** — Working DualSense UDP injection over LAN.
-- [ ] **Phase 4: Headless Daemon (`nullwire-daemon`)** — Standalone C++ daemon with zero Qt/GUI dependencies, blackholing video packets at socket level (<1% CPU, <15MB RAM).
-- [ ] **Phase 5: Cross-Platform Raw Input Hooks** — Linux `evdev` and Windows `RawInput` backends for sub-millisecond 8000Hz polling rate mice.
+Right now, Nullwire runs inside a patched build of `chiaki-ng`. 
+
+Our next milestone is **`nullwire-daemon`**:
+* A tiny, headless background service written in C++.
+* No Qt interface. No video decoding. No audio pipeline.
+* Drops incoming video packets at the network socket layer to keep CPU usage under 1% and RAM under 15MB.
+* Pure, silent, ultra-low-latency input injection over local Ethernet.
 
 ---
 
-## 📜 License & Ethics
+## 🤝 Philosophy & License
 
-Distributed under the MIT License. Built for input research, accessibility, and precision gaming without predatory proprietary hardware.
+Nullwire is released under the **MIT License**. It was created to prove that precision input and accessibility do not require predatory $250 proprietary hardware dongles. Built with curiosity and math.
